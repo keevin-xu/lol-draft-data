@@ -1,0 +1,21 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data (never commit raw or processed data)
+data/
+
+# Database
+db/*.db
+db/*.sqlite
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
