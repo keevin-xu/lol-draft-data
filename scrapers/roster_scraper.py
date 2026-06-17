@@ -103,6 +103,9 @@ def _make_session() -> requests.Session:
         total=4,
         backoff_factor=2,
         status_forcelist=[500, 502, 503, 504],
+        # Cargo reads are sent via POST (see _cargo_query); without this,
+        # urllib3 would not retry POST on 5xx since it treats POST as non-idempotent.
+        allowed_methods=frozenset(["GET", "POST"]),
     )
     session.mount("https://", HTTPAdapter(max_retries=retry))
     return session
@@ -125,9 +128,12 @@ def _cargo_query(
 
     for attempt in range(retries):
         time.sleep(API_DELAY)
-        r = session.get(
+        # POST (not GET): keeps long batched `OverviewPage IN (...)` queries in the
+        # request body so they can't trip URL-length limits or proxy/WAF rules.
+        # MediaWiki returns identical JSON for GET vs POST cargoquery.
+        r = session.post(
             LEAGUEPEDIA_API,
-            params=full_params,
+            data=full_params,
             headers=LEAGUEPEDIA_HEADERS,
             timeout=30,
         )
@@ -254,15 +260,26 @@ def _clean_player_name(raw: str) -> str:
     return name
 
 
-def fetch_rosters(overview_page: str, session: requests.Session) -> List[Dict[str, Any]]:
-    """Fetch all TournamentRosters rows for a given OverviewPage."""
-    # Escape single quotes in overview_page (unlikely but safe)
-    safe_page = overview_page.replace("'", "\\'")
-    return _cargo_query(session, {
+def fetch_rosters(
+    overview_pages: List[str], session: requests.Session
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all TournamentRosters rows for the given OverviewPages in a single
+    batched query (OverviewPage IN (...)), paginating only if the combined
+    result spans more than one page.
+
+    Each returned row includes its OverviewPage so the caller can map it back
+    to the originating tournament. Replaces the previous one-request-per-
+    tournament loop to minimise calls against Leaguepedia's rate limit.
+    """
+    if not overview_pages:
+        return []
+    # Escape single quotes (unlikely but safe) and build the IN (...) list
+    quoted = ", ".join("'" + p.replace("'", "\\'") + "'" for p in overview_pages)
+    return _cargo_query_all(session, {
         "tables": "TournamentRosters",
         "fields": "Team,OverviewPage,RosterLinks,Roles",
-        "where": f"OverviewPage='{safe_page}'",
-        "limit": "200",
+        "where": f"OverviewPage IN ({quoted})",
     })
 
 
@@ -380,17 +397,29 @@ def main() -> None:
     target_tournaments = select_latest_per_league(all_tournaments)
     logger.info(f"  Targeting {len(target_tournaments)} tournaments (one per league)")
 
-    # 2. Fetch rosters for each selected tournament
+    # 2. Fetch rosters for all selected tournaments in a single batched query
+    by_page = {t["overview_page"]: t for t in target_tournaments}
+    pages = [t["overview_page"] for t in target_tournaments]
+    logger.info(f"  Fetching rosters for {len(pages)} tournaments in one batched query…")
+    roster_rows = fetch_rosters(pages, session)
+    logger.info(f"  Retrieved {len(roster_rows)} roster rows")
+
     all_entries: List[Dict[str, Any]] = []
-    for t in target_tournaments:
-        logger.info(f"  Fetching rosters: {t['name']}")
-        roster_rows = fetch_rosters(t["overview_page"], session)
-        if not roster_rows:
-            logger.warning(f"  No roster data for {t['name']} — skipping")
+    seen_pages = set()
+    for row in roster_rows:
+        page = row.get("OverviewPage", "")
+        t = by_page.get(page)
+        if t is None:
+            logger.warning(f"  Roster row with unmapped OverviewPage {page!r} — skipping")
             continue
-        for row in roster_rows:
-            entries = parse_roster_row(row, t["name"], t["oe_league"])
-            all_entries.extend(entries)
+        seen_pages.add(page)
+        entries = parse_roster_row(row, t["name"], t["oe_league"])
+        all_entries.extend(entries)
+
+    # Preserve the old per-tournament "no roster data" visibility
+    for page, t in by_page.items():
+        if page not in seen_pages:
+            logger.warning(f"  No roster data for {t['name']} — skipped")
 
     logger.info(f"Fetched {len(all_entries)} player-slot entries across all leagues")
 
