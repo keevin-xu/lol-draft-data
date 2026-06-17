@@ -9,6 +9,7 @@ Run:  python scrapers/roster_scraper.py
 """
 
 import json
+import os
 import re
 import sqlite3
 import time
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
 from loguru import logger
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -31,12 +33,18 @@ RAW_DIR = _ROOT / "data" / "raw" / "rosters"
 PROCESSED_DIR = _ROOT / "data" / "processed"
 UNMATCHED_PATH = PROCESSED_DIR / "unmatched_players.json"
 
+# Load credentials / config from .env (no-op if the file is absent)
+load_dotenv(_ROOT / ".env")
+
 # ---------------------------------------------------------------------------
 # Leaguepedia Cargo API
 # ---------------------------------------------------------------------------
 LEAGUEPEDIA_API = "https://lol.fandom.com/api.php"
+# Contact email in the UA is overridable via LEAGUEPEDIA_USER_AGENT in .env so
+# each dev advertises their own contact.
+_DEFAULT_UA = "lol-prediction-model/1.0 (kevrocksxd@gmail.com)"
 LEAGUEPEDIA_HEADERS = {
-    "User-Agent": "lol-prediction-model/1.0 (stevenmaswim@gmail.com)",
+    "User-Agent": os.environ.get("LEAGUEPEDIA_USER_AGENT", "").strip() or _DEFAULT_UA,
     "Accept": "application/json",
 }
 # Seconds between API calls; Leaguepedia rate-limits aggressive scrapers
@@ -109,6 +117,66 @@ def _make_session() -> requests.Session:
     )
     session.mount("https://", HTTPAdapter(max_retries=retry))
     return session
+
+
+# ---------------------------------------------------------------------------
+# Authentication (optional — raises the rate-limit ceiling)
+# ---------------------------------------------------------------------------
+def login(session: requests.Session) -> bool:
+    """
+    Authenticate the session with a Leaguepedia bot password if credentials are
+    present in the environment. Returns True on success, False if no credentials
+    are configured (the caller then proceeds anonymously, exactly as before).
+
+    Standard MediaWiki action=login flow:
+      1. POST action=query&meta=tokens&type=login  → login token
+      2. POST action=login with lgname / lgpassword / lgtoken
+    Session cookies carry the authenticated state into later Cargo requests.
+    """
+    username = os.environ.get("LEAGUEPEDIA_USERNAME", "").strip()
+    password = os.environ.get("LEAGUEPEDIA_BOT_PASSWORD", "").strip()
+    if not username or not password:
+        logger.warning(
+            "No LEAGUEPEDIA_USERNAME / LEAGUEPEDIA_BOT_PASSWORD in env — "
+            "running anonymously (lower rate-limit ceiling)."
+        )
+        return False
+
+    # 1. Fetch a login token
+    r = session.post(
+        LEAGUEPEDIA_API,
+        data={"action": "query", "meta": "tokens", "type": "login", "format": "json"},
+        headers=LEAGUEPEDIA_HEADERS,
+        timeout=30,
+    )
+    r.raise_for_status()
+    token = r.json()["query"]["tokens"]["logintoken"]
+
+    # 2. Submit bot-password credentials
+    r = session.post(
+        LEAGUEPEDIA_API,
+        data={
+            "action": "login",
+            "lgname": username,
+            "lgpassword": password,
+            "lgtoken": token,
+            "format": "json",
+        },
+        headers=LEAGUEPEDIA_HEADERS,
+        timeout=30,
+    )
+    r.raise_for_status()
+    result = r.json().get("login", {})
+    if result.get("result") == "Success":
+        logger.info(
+            f"Authenticated to Leaguepedia as {result.get('lgusername', username)} "
+            "(higher rate-limit ceiling)"
+        )
+        return True
+
+    raise RuntimeError(
+        f"Leaguepedia login failed: {result.get('result')} — {result.get('reason', '')}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +457,7 @@ def main() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     session = _make_session()
+    login(session)  # authenticates if creds are in .env; otherwise anonymous
     snapshot_date = date.today().isoformat()
 
     # 1. Discover 2026 secondary tournaments for our leagues
