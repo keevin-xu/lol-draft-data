@@ -9,8 +9,8 @@ __pycache__/
 data/
 
 # Database
-db/*.db
-db/*.sqlite
+# db/*.db
+# db/*.sqlite
 
 # Jupyter
 .ipynb_checkpoints/
