@@ -140,6 +140,29 @@ def _normalize_role(role: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Regional aggregation
+# ---------------------------------------------------------------------------
+def get_regional_soloq_averages() -> Dict[str, float]:
+    """
+    Average soloq rating per player region (only rated players).
+    Returns {"KR": 3122.4, "EU": 3109.3, ...}.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """
+        SELECT p.region, AVG(a.soloq_rating) as avg_rating
+        FROM players p
+        JOIN accounts a ON a.player_id = p.id
+        WHERE a.soloq_rating > 0
+          AND p.region IS NOT NULL AND p.region != ''
+        GROUP BY p.region
+        """,
+    ).fetchall()
+    conn.close()
+    return {region: float(avg) for region, avg in rows}
+
+
+# ---------------------------------------------------------------------------
 # Standalone entry point
 # ---------------------------------------------------------------------------
 def main() -> None:

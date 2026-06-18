@@ -20,7 +20,7 @@ from loguru import logger
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from model.pro_elo import DEFAULT_ELO, get_team_soloq_elos
+from model.pro_elo import DEFAULT_ELO, get_league_offset, get_team_soloq_elos
 
 DB_PATH = _ROOT / "db" / "lol_model.db"
 
@@ -32,7 +32,7 @@ def compute_blended_rating(
     pro_elo: float,
     soloq_elo: float,
     games_played: int,
-    blend_k: int = 10,
+    blend_k: int = 5,
 ) -> float:
     """
     Pure function. Blend pro ELO and soloq baseline.
@@ -49,7 +49,7 @@ def compute_blended_rating(
 # ---------------------------------------------------------------------------
 # DB-backed lookups
 # ---------------------------------------------------------------------------
-def get_team_rating(team_name: str, blend_k: int = 10) -> float:
+def get_team_rating(team_name: str, blend_k: int = 5) -> float:
     """
     Return the blended rating for a single team.
 
@@ -57,7 +57,7 @@ def get_team_rating(team_name: str, blend_k: int = 10) -> float:
     """
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT pro_elo, games_played FROM teams WHERE team_name = ?",
+        "SELECT pro_elo, games_played, league FROM teams WHERE team_name = ?",
         (team_name,),
     ).fetchone()
     conn.close()
@@ -65,20 +65,20 @@ def get_team_rating(team_name: str, blend_k: int = 10) -> float:
     if row is None:
         return DEFAULT_ELO
 
-    pro_elo, games_played = float(row[0]), int(row[1])
+    pro_elo, games_played, league = float(row[0]), int(row[1]), row[2] or ""
     soloq_elos = get_team_soloq_elos()
-    soloq_elo = soloq_elos.get(team_name, DEFAULT_ELO)
+    soloq_elo = soloq_elos.get(team_name, DEFAULT_ELO + get_league_offset(league))
 
     return compute_blended_rating(pro_elo, soloq_elo, games_played, blend_k)
 
 
-def get_all_ratings(blend_k: int = 10) -> Dict[str, float]:
+def get_all_ratings(blend_k: int = 5) -> Dict[str, float]:
     """
     Return blended ratings for every team in the teams table.
     """
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT team_name, pro_elo, games_played FROM teams"
+        "SELECT team_name, pro_elo, games_played, league FROM teams"
     ).fetchall()
     conn.close()
 
@@ -87,11 +87,11 @@ def get_all_ratings(blend_k: int = 10) -> Dict[str, float]:
     return {
         team: compute_blended_rating(
             float(pro_elo),
-            soloq_elos.get(team, DEFAULT_ELO),
+            soloq_elos.get(team, DEFAULT_ELO + get_league_offset(league or "")),
             int(gp),
             blend_k,
         )
-        for team, pro_elo, gp in rows
+        for team, pro_elo, gp, league in rows
     }
 
 
