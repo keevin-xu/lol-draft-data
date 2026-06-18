@@ -30,6 +30,13 @@ load_dotenv(_ROOT / ".env")
 from model.blend import get_all_ratings
 from model.predict import predict_match
 from polymarket.edge import EdgeSignal, find_edges, format_signal
+from polymarket.paper_trader import (
+    check_resolutions,
+    get_open_positions,
+    get_portfolio_summary,
+    get_trade_history,
+    place_bet,
+)
 from polymarket.scanner import MarketOpportunity, scan
 
 # ---------------------------------------------------------------------------
@@ -114,14 +121,74 @@ class LoLEdgeBot(discord.Client):
             hours = int(uptime.total_seconds() // 3600)
             minutes = int((uptime.total_seconds() % 3600) // 60)
             last = self.last_scan.strftime("%H:%M UTC") if self.last_scan else "never"
+            summary = get_portfolio_summary()
             embed = discord.Embed(title="Bot Status", color=discord.Color.green())
             embed.add_field(name="Uptime", value=f"{hours}h {minutes}m", inline=True)
             embed.add_field(name="Scans Run", value=str(self.scan_count), inline=True)
-            embed.add_field(name="Markets Found", value=str(self.markets_found), inline=True)
             embed.add_field(name="Last Scan", value=last, inline=True)
-            embed.add_field(name="Scan Interval", value=f"{SCAN_INTERVAL_MINUTES}m", inline=True)
-            embed.add_field(name="Min Edge", value=f"{MIN_EDGE:.0%}", inline=True)
+            embed.add_field(name="Bankroll", value=f"${summary.bankroll:,.2f}", inline=True)
+            embed.add_field(name="Paper P&L", value=f"${summary.total_pnl:+,.2f}", inline=True)
+            embed.add_field(name="Open Bets", value=str(summary.open_positions), inline=True)
             await interaction.response.send_message(embed=embed)
+
+        @self.tree.command(name="portfolio", description="Paper trading portfolio summary")
+        async def cmd_portfolio(interaction: discord.Interaction) -> None:
+            s = get_portfolio_summary()
+            embed = discord.Embed(title="Paper Trading Portfolio", color=discord.Color.blue())
+            embed.add_field(name="Bankroll", value=f"${s.bankroll:,.2f}", inline=True)
+            embed.add_field(name="Starting", value=f"$1,000.00", inline=True)
+            embed.add_field(name="ROI", value=f"{s.roi:+.1%}", inline=True)
+            embed.add_field(name="Total P&L", value=f"${s.total_pnl:+,.2f}", inline=True)
+            embed.add_field(name="Win Rate", value=f"{s.win_rate:.0%}" if s.total_bets > 0 else "N/A", inline=True)
+            embed.add_field(name="Record", value=f"{s.wins}W / {s.losses}L", inline=True)
+            embed.add_field(name="Open Positions", value=str(s.open_positions), inline=True)
+            embed.add_field(name="Total Bets", value=str(s.total_bets), inline=True)
+            await interaction.response.send_message(embed=embed)
+
+        @self.tree.command(name="trades", description="Recent paper trades")
+        async def cmd_trades(interaction: discord.Interaction) -> None:
+            open_pos = get_open_positions()
+            history = get_trade_history(limit=10)
+
+            lines = []
+            if open_pos:
+                lines.append("**Open Positions:**")
+                for t in open_pos:
+                    lines.append(
+                        f"`{t.bet_team}` ${t.amount:.2f} @ {t.entry_price:.0%} "
+                        f"(edge {t.edge:.1%})"
+                    )
+            if history:
+                lines.append("\n**Recent Settled:**")
+                for t in history:
+                    icon = "+" if t.status == "won" else "-"
+                    lines.append(
+                        f"`{icon}` {t.bet_team} ${t.profit_loss:+.2f} "
+                        f"(entry {t.entry_price:.0%}, model {t.model_prob:.0%})"
+                    )
+            if not lines:
+                lines.append("No paper trades yet. Waiting for LoL T2 markets on Polymarket.")
+
+            embed = discord.Embed(
+                title="Paper Trades",
+                description="\n".join(lines),
+                color=discord.Color.purple(),
+            )
+            await interaction.response.send_message(embed=embed)
+
+        @self.tree.command(name="settle", description="Force check for resolved markets")
+        async def cmd_settle(interaction: discord.Interaction) -> None:
+            await interaction.response.defer()
+            settled = check_resolutions()
+            if not settled:
+                await interaction.followup.send("No open positions resolved yet.")
+                return
+            for t in settled:
+                icon = "+" if t.status == "won" else "-"
+                pnl = t.profit_loss or 0
+                await interaction.followup.send(
+                    f"**{icon} Settled:** {t.bet_team} → {t.status.upper()} (${pnl:+.2f})"
+                )
 
     # -----------------------------------------------------------------------
     # Embed builder
@@ -196,8 +263,52 @@ class LoLEdgeBot(discord.Client):
                     self._notified[sig.opportunity.market_id] = sig
                     logger.info(f"  Alerted: {sig.opportunity.db_team_a} vs {sig.opportunity.db_team_b} (edge={sig.edge:.1%})")
 
+                    # Paper trade: auto-place bet on new signals
+                    trade = place_bet(sig)
+                    if trade:
+                        await channel.send(
+                            f"**Paper bet placed:** ${trade.amount:.2f} on "
+                            f"**{trade.bet_team}** @ {trade.entry_price:.0%} "
+                            f"(edge: {trade.edge:.1%}, Kelly: {trade.kelly_fraction:.1%})"
+                        )
+
         except Exception as e:
             logger.error(f"Scan loop error: {e}")
+
+    @tasks.loop(hours=1)
+    async def settle_loop(self) -> None:
+        """Hourly check for resolved markets and settled positions."""
+        try:
+            settled = check_resolutions()
+            if not settled:
+                return
+
+            channel = self.get_channel(self.channel_id)
+            if not channel:
+                return
+
+            for t in settled:
+                won = t.status == "won"
+                pnl = t.profit_loss or 0
+                summary = get_portfolio_summary()
+                embed = discord.Embed(
+                    title=f"{'WIN' if won else 'LOSS'}: {t.bet_team}",
+                    color=discord.Color.green() if won else discord.Color.red(),
+                )
+                embed.add_field(name="P&L", value=f"${pnl:+.2f}", inline=True)
+                embed.add_field(name="Entry", value=f"{t.entry_price:.0%}", inline=True)
+                embed.add_field(name="Model", value=f"{t.model_prob:.0%}", inline=True)
+                embed.add_field(name="Bankroll", value=f"${summary.bankroll:,.2f}", inline=True)
+                embed.add_field(name="Record", value=f"{summary.wins}W / {summary.losses}L", inline=True)
+                embed.add_field(name="ROI", value=f"{summary.roi:+.1%}", inline=True)
+                await channel.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Settle loop error: {e}")
+
+    @settle_loop.before_loop
+    async def before_settle_loop(self) -> None:
+        await self.wait_until_ready()
 
     @scan_loop.before_loop
     async def before_scan_loop(self) -> None:
@@ -216,17 +327,24 @@ class LoLEdgeBot(discord.Client):
         except Exception as e:
             logger.error(f"Failed to sync commands: {e}")
 
-        # Start scan loop
+        # Start loops
         if not self.scan_loop.is_running():
             self.scan_loop.start()
             logger.info(f"Scan loop started (every {SCAN_INTERVAL_MINUTES} minutes)")
+        if not self.settle_loop.is_running():
+            self.settle_loop.start()
+            logger.info("Settlement loop started (every 1 hour)")
 
         # Send startup message
+        summary = get_portfolio_summary()
         channel = self.get_channel(self.channel_id)
         if channel:
             await channel.send(
-                f"**LoL T2 Edge Bot online.** Scanning Polymarket every {SCAN_INTERVAL_MINUTES} minutes.\n"
-                f"Commands: `/scan` `/predict` `/leaderboard` `/status`"
+                f"**LoL T2 Edge Bot online.** Paper trading enabled.\n"
+                f"Bankroll: ${summary.bankroll:,.2f} | "
+                f"Record: {summary.wins}W/{summary.losses}L | "
+                f"Open: {summary.open_positions}\n"
+                f"Commands: `/scan` `/predict` `/portfolio` `/trades` `/settle` `/leaderboard` `/status`"
             )
 
     async def setup_hook(self) -> None:
